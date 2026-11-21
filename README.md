@@ -20,11 +20,11 @@ The interesting parts are the ones that are easy to get subtly wrong: **timezone
 - **No double bookings**: re-checked inside a write transaction, with a unique index as a safety net.
 - **Owner dashboard**: list, filter and cancel bookings; cancellations email the customer.
 - **Safety rails**: Zod validation on every route, in-memory rate limiting, same-origin check on state-changing requests.
-- **Email**: prints to the console by default; sends through Resend when `RESEND_API_KEY` is set.
+- **Email**: prints to the console by default; sends through Resend (`RESEND_API_KEY`) or any SMTP server such as Gmail (`SMTP_USER` + `SMTP_PASS`) when configured.
 
 ## Quick start
 
-Requires **Node 22.12 or newer** (see `.nvmrc`; run `nvm use`).
+Requires **Node 22.12 or newer** (see `.nvmrc`; run `nvm use`). Node 20 is end-of-life and the test runner needs 22.12+.
 
 ```bash
 npm install
@@ -127,7 +127,7 @@ tests/               slots, bookings, api (end-to-end), auth, validators, rateli
 
 **Rate limiting.** Sliding-window log in memory: 10 booking attempts/min/IP, 60 slot lookups/min/IP, 10 auth attempts/15 min/IP. Returns 429 with `Retry-After`.
 
-**Mailer abstraction.** A two-method interface with `ConsoleMailer` (default, zero setup) and `ResendMailer` (plain `fetch`, no SDK). Callers never know which one they have.
+**Mailer abstraction.** A one-method interface with three implementations: `ConsoleMailer` (default, zero setup), `ResendMailer` (plain `fetch`, no SDK) and `SmtpMailer` (nodemailer, e.g. Gmail). `getMailer()` picks one from the environment. Callers never know which, and a delivery failure is logged but never fails a booking.
 
 **Database portability.** Drizzle with `better-sqlite3` for a zero-setup clone-and-run. The schema uses only portable types. `lib/migrate.ts` is plain idempotent SQL for the bootstrap; moving to Postgres means generating real migrations with `drizzle-kit`, swapping the driver, and replacing the transaction/index strategy as described below.
 
@@ -181,6 +181,20 @@ npm test
 
 CI (`.github/workflows/ci.yml`) runs typecheck, tests and a production build on every push and pull request.
 
+## Sending real email (Gmail)
+
+By default booking emails only appear in the terminal. To deliver them for real with a Gmail account:
+
+1. Turn on 2-Step Verification for the Google account, then create an **App Password** at https://myaccount.google.com/apppasswords.
+2. Create `.env.local` in the project root:
+   ```
+   SMTP_USER=you@gmail.com
+   SMTP_PASS=your16characterapppassword
+   ```
+3. Restart `npm run dev` (env files are read on startup).
+
+Gmail works for demos (any recipient, no domain needed, roughly 500 messages a day). For production use a transactional provider such as Resend, Postmark or SES with a verified domain.
+
 ## Deploying
 
 Environment variables (see `.env.example`):
@@ -190,7 +204,11 @@ Environment variables (see `.env.example`):
 | `JWT_SECRET` | **Required in production.** `openssl rand -base64 32` |
 | `DATABASE_PATH` | SQLite file path. Defaults to `./data/slotly.db` (`/tmp/slotly.db` on Vercel) |
 | `SLOTLY_DEMO_SEED=1` | Create the demo business when the database is empty |
-| `RESEND_API_KEY`, `MAIL_FROM` | Enable real email; otherwise emails are logged |
+| `RESEND_API_KEY`, `MAIL_FROM` | Send email through Resend (needs a verified domain to reach arbitrary recipients) |
+| `SMTP_USER`, `SMTP_PASS` | Send email through SMTP; Gmail by default. Use a Gmail **App Password**, not your login password |
+| `SMTP_HOST`, `SMTP_PORT` | Optional. Default `smtp.gmail.com` / `465` |
+
+If none of the email variables are set, emails are printed to the server console.
 | `INSECURE_COOKIES=1` | Only for running a production build over plain `http://localhost` |
 
 **Vercel (portfolio demo).** Import the repo, set `JWT_SECRET` and `SLOTLY_DEMO_SEED=1`, deploy. Because `/tmp` is per-instance and wiped on cold starts, treat the data as disposable and expect that two requests may occasionally hit different instances. Good enough to click around; not good enough to hand to a client. For a durable deployment, move to Postgres (below) or deploy the same code to a host with a persistent disk.

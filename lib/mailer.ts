@@ -1,4 +1,5 @@
 import { DateTime } from "luxon";
+import nodemailer from "nodemailer";
 import type { Booking, Business, Service } from "./schema";
 
 export interface Email {
@@ -36,10 +37,53 @@ export class ResendMailer implements Mailer {
   }
 }
 
+/** The one method of a nodemailer transport we use (lets tests pass a fake). */
+export interface MailTransport {
+  sendMail(message: { from: string; to: string; subject: string; text: string }): Promise<unknown>;
+}
+
+/**
+ * Any SMTP server, including Gmail (smtp.gmail.com + an App Password).
+ * Handy for demos: sends to any recipient with no domain verification.
+ * For production prefer a transactional provider (Resend, Postmark, SES).
+ */
+export class SmtpMailer implements Mailer {
+  constructor(
+    private transport: MailTransport,
+    private from: string,
+  ) {}
+
+  async send(email: Email): Promise<void> {
+    await this.transport.sendMail({ from: this.from, to: email.to, subject: email.subject, text: email.text });
+  }
+}
+
+/**
+ * Pick a mailer from the environment, first match wins:
+ *   1. RESEND_API_KEY            -> Resend
+ *   2. SMTP_USER + SMTP_PASS     -> SMTP (Gmail by default)
+ *   3. nothing                   -> print to the console
+ */
 export function getMailer(): Mailer {
-  const key = process.env.RESEND_API_KEY;
-  if (!key) return new ConsoleMailer();
-  return new ResendMailer(key, process.env.MAIL_FROM ?? "Slotly <onboarding@resend.dev>");
+  const resendKey = process.env.RESEND_API_KEY;
+  if (resendKey) {
+    return new ResendMailer(resendKey, process.env.MAIL_FROM ?? "Slotly <onboarding@resend.dev>");
+  }
+
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  if (user && pass) {
+    const port = Number(process.env.SMTP_PORT ?? 465);
+    const transport = nodemailer.createTransport({
+      host: process.env.SMTP_HOST ?? "smtp.gmail.com",
+      port,
+      secure: port === 465, // implicit TLS on 465; STARTTLS on 587
+      auth: { user, pass },
+    });
+    return new SmtpMailer(transport, process.env.MAIL_FROM ?? `Slotly <${user}>`);
+  }
+
+  return new ConsoleMailer();
 }
 
 /** A failed email must never fail the booking: log and carry on. */
