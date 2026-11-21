@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
+import { asc, eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { readJson, route } from "@/lib/api";
-import { insertRow, NO_ID } from "@/lib/db";
 import { requireAuth } from "@/lib/guard";
-import type { Service } from "@/lib/schema";
+import { services } from "@/lib/schema";
 import { apiService } from "@/lib/serialize";
 import { serviceCreateSchema } from "@/lib/validators";
 
@@ -12,14 +12,14 @@ export const dynamic = "force-dynamic";
 
 export const GET = route(async (req) => {
   const { db, business } = await requireAuth(req);
-  const rows = await db.services.find({ businessId: business.id }, NO_ID).sort({ createdAt: 1 }).toArray();
+  const rows = await db.select().from(services).where(eq(services.businessId, business.id)).orderBy(asc(services.createdAt));
   return NextResponse.json({ services: rows.map(apiService) });
 });
 
 export const POST = route(async (req) => {
   const { db, business } = await requireAuth(req, ["owner"]);
   const input = await readJson(req, serviceCreateSchema);
-  const row: Service = { id: randomUUID(), businessId: business.id, ...input, active: true, createdAt: Date.now() };
-  await insertRow(db.services, row);
+  const row = { id: randomUUID(), businessId: business.id, ...input, active: true, createdAt: Date.now() };
+  await db.insert(services).values(row);
   return NextResponse.json({ service: apiService(row) }, { status: 201 });
 });

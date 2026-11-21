@@ -1,104 +1,90 @@
-import { MongoClient, type Collection, type Db, type OptionalUnlessRequiredId } from "mongodb";
+import { drizzle } from "drizzle-orm/node-postgres";
+import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
+import { Pool } from "pg";
+import { MIGRATION_SQL } from "./migrate";
+import * as schema from "./schema";
 import { seedDemoIfMissing } from "./seed";
-import type { AvailabilityRow, Booking, BookingLock, Business, Service, User } from "./schema";
 
-/** A stored document: the app-level entity plus Mongo's `_id` (always equal to `id`). */
-export type Doc<T extends { id: string }> = T & { _id: string };
+/** Works for both a pooled node-postgres connection (production) and PGlite (tests, local dev). */
+export type DB = PgDatabase<PgQueryResultHKT, typeof schema>;
 
-export interface DB {
-  client: MongoClient;
-  db: Db;
-  businesses: Collection<Doc<Business>>;
-  users: Collection<Doc<User>>;
-  services: Collection<Doc<Service>>;
-  availability: Collection<Doc<AvailabilityRow>>;
-  bookings: Collection<Doc<Booking>>;
-  locks: Collection<BookingLock>;
+const MIGRATION_LOCK_KEY = 727274;
+
+/** Connect to Postgres (Neon, Supabase, local...) and make sure the schema exists. */
+export async function createDb(connectionString: string): Promise<DB> {
+  const pool = new Pool({ connectionString, max: Number(process.env.PG_POOL_MAX ?? 5) });
+  const client = await pool.connect();
+  try {
+    // Serialise bootstrap across concurrent cold starts (CREATE EXTENSION / TABLE IF NOT EXISTS can race).
+    await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK_KEY]);
+    await client.query(MIGRATION_SQL);
+  } finally {
+    await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_KEY]).catch(() => {});
+    client.release();
+  }
+  return drizzle(pool, { schema }) as unknown as DB;
 }
 
-/** Pass to find/findOne so `_id` never leaks into application objects. */
-export const NO_ID = { projection: { _id: 0 } } as const;
-
-/** Insert an entity, using its `id` as the document `_id`. */
-export async function insertRow<T extends { id: string }>(col: Collection<Doc<T>>, row: T): Promise<void> {
-  await col.insertOne({ _id: row.id, ...row } as unknown as OptionalUnlessRequiredId<Doc<T>>);
-}
-
-export async function insertRows<T extends { id: string }>(col: Collection<Doc<T>>, rows: T[]): Promise<void> {
-  if (rows.length === 0) return;
-  await col.insertMany(rows.map((r) => ({ _id: r.id, ...r }) as unknown as OptionalUnlessRequiredId<Doc<T>>));
-}
-
-/** True for MongoDB duplicate-key errors (code 11000), including ones wrapped in bulk-write errors. */
-export function isDuplicateKeyError(e: unknown): boolean {
-  if (typeof e !== "object" || e === null) return false;
-  const err = e as { code?: unknown; writeErrors?: unknown; cause?: unknown };
-  if (err.code === 11000 || err.code === 11001) return true;
-  if (Array.isArray(err.writeErrors) && err.writeErrors.some((w) => (w as { code?: unknown })?.code === 11000)) return true;
-  return err.cause !== undefined && isDuplicateKeyError(err.cause);
-}
+// Loaded through a variable so the bundler and the serverless file tracer never pull the
+// (large, dev-only) PGlite WebAssembly build into a production deployment.
+const dynamicImport = (specifier: string) => import(/* webpackIgnore: true */ /* @vite-ignore */ specifier);
 
 /**
- * Connect and make sure the indexes exist (idempotent: safe to run on every cold start).
- * No transactions are used anywhere, so this works on a standalone mongod, a replica set
- * and every Atlas tier, including the free one.
+ * A real Postgres running inside this Node process (PGlite, WebAssembly). Same SQL, same
+ * constraints and transactions as production, no server to install. Used by the tests and by
+ * local development when DATABASE_URL is not set. Data lives in memory.
  */
-export async function createDb(uri: string, dbName: string): Promise<DB> {
-  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 8000, ignoreUndefined: true });
-  await client.connect();
-  const db = client.db(dbName);
-
-  const handle: DB = {
-    client,
-    db,
-    businesses: db.collection("businesses"),
-    users: db.collection("users"),
-    services: db.collection("services"),
-    availability: db.collection("availability"),
-    bookings: db.collection("bookings"),
-    locks: db.collection("booking_locks"),
-  };
-
-  await Promise.all([
-    handle.businesses.createIndex({ slug: 1 }, { unique: true }),
-    handle.users.createIndex({ email: 1 }, { unique: true }),
-    handle.users.createIndex({ businessId: 1, createdAt: 1 }),
-    handle.services.createIndex({ businessId: 1, createdAt: 1 }),
-    handle.availability.createIndex({ businessId: 1, weekday: 1, startMin: 1 }),
-    handle.bookings.createIndex({ businessId: 1, startsAt: 1 }),
-    // Safety net behind the lock documents: two *confirmed* bookings can never share a start
-    // time for one business. (Partial overlaps are what the per-minute locks are for.)
-    handle.bookings.createIndex(
-      { businessId: 1, startsAt: 1 },
-      { unique: true, partialFilterExpression: { status: "confirmed" }, name: "bookings_active_start_uq" },
-    ),
-    handle.locks.createIndex({ bookingId: 1 }),
-    handle.locks.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
-  ]);
-
-  return handle;
+export async function createPgliteDb(): Promise<DB> {
+  const { PGlite } = await dynamicImport("@electric-sql/pglite");
+  const { btree_gist } = await dynamicImport("@electric-sql/pglite/contrib/btree_gist");
+  const { drizzle: drizzlePglite } = await dynamicImport("drizzle-orm/pglite");
+  const client = new PGlite({ extensions: { btree_gist } });
+  await client.exec(MIGRATION_SQL);
+  return drizzlePglite(client, { schema }) as DB;
 }
 
-function config() {
-  const uri = process.env.MONGODB_URI;
-  if (!uri) {
-    throw new Error(
-      "MONGODB_URI is not set. Create a free MongoDB Atlas cluster (or run mongod locally) and put the connection string in .env.local.",
-    );
+/** Release the connection(s) behind a DB created by createDb / createPgliteDb. */
+export async function closeDb(db: DB): Promise<void> {
+  const client = (db as unknown as { $client?: { end?: () => Promise<void>; close?: () => Promise<void> } }).$client;
+  if (client?.end) await client.end();
+  else if (client?.close) await client.close();
+}
+
+/** The SQLSTATE of a Postgres error, looking through wrapper errors (Drizzle wraps the driver's). */
+function pgCode(e: unknown): string | undefined {
+  for (let err: unknown = e; err instanceof Error; err = (err as { cause?: unknown }).cause) {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return code;
   }
-  return { uri, dbName: process.env.MONGODB_DB ?? "slotly" };
+  return undefined;
 }
 
-// One connection per server process; survives dev-server hot reloads and is reused across
+/** 23505: a UNIQUE constraint or primary key was violated. */
+export const isUniqueViolation = (e: unknown) => pgCode(e) === "23505";
+/** 23P01: the bookings_no_overlap EXCLUDE constraint was violated. */
+export const isExclusionViolation = (e: unknown) => pgCode(e) === "23P01";
+
+function open(): Promise<DB> {
+  const url = process.env.DATABASE_URL;
+  if (url === "pglite://memory") return createPgliteDb();
+  if (url) return createDb(url);
+  if (process.env.NODE_ENV === "production" || process.env.VERCEL) {
+    throw new Error("DATABASE_URL is not set. Create a Postgres database (e.g. a free Neon project) and set its connection string.");
+  }
+  console.warn("[slotly] DATABASE_URL is not set: using an in-memory Postgres (PGlite). Data resets when the server restarts.");
+  return createPgliteDb();
+}
+
+// One connection pool per server process; survives dev-server hot reloads and is reused across
 // warm serverless invocations. Caching the *promise* means concurrent first requests share it.
 const g = globalThis as unknown as { __slotlyDb?: Promise<DB> };
 
 export function getDb(): Promise<DB> {
   if (!g.__slotlyDb) {
-    const { uri, dbName } = config();
-    g.__slotlyDb = createDb(uri, dbName)
+    const inMemory = !process.env.DATABASE_URL || process.env.DATABASE_URL === "pglite://memory";
+    g.__slotlyDb = open()
       .then(async (db) => {
-        if (process.env.SLOTLY_DEMO_SEED === "1") await seedDemoIfMissing(db);
+        if (inMemory || process.env.SLOTLY_DEMO_SEED === "1") await seedDemoIfMissing(db);
         return db;
       })
       .catch((e) => {

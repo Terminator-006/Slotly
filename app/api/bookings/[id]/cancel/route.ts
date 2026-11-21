@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
+import { and, eq } from "drizzle-orm";
 import { ApiError, routeWithParams } from "@/lib/api";
 import { cancelBooking } from "@/lib/bookings";
-import { NO_ID } from "@/lib/db";
 import { requireAuth } from "@/lib/guard";
 import { bookingCancelledEmail, getMailer, safeSend } from "@/lib/mailer";
+import { bookings, services } from "@/lib/schema";
 import { apiBooking } from "@/lib/serialize";
 
 export const runtime = "nodejs";
@@ -13,15 +14,19 @@ export const dynamic = "force-dynamic";
 export const POST = routeWithParams<{ id: string }>(async (req, { id }) => {
   const { db, business } = await requireAuth(req, ["owner", "staff"]);
 
-  const before = await db.bookings.findOne({ _id: id, businessId: business.id }, NO_ID);
+  const [before] = await db
+    .select()
+    .from(bookings)
+    .where(and(eq(bookings.id, id), eq(bookings.businessId, business.id)))
+    .limit(1);
   if (!before) throw new ApiError(404, "not_found", "Booking not found");
 
   const booking = (await cancelBooking(db, business.id, id))!;
-  const service = (await db.services.findOne({ _id: booking.serviceId }, NO_ID))!;
+  const [service] = await db.select().from(services).where(eq(services.id, booking.serviceId)).limit(1);
 
   // Only email on the transition, not on a repeated cancel.
   if (before.status === "confirmed") {
-    await safeSend(getMailer(), bookingCancelledEmail(booking, business, service));
+    await safeSend(getMailer(), bookingCancelledEmail(booking, business, service!));
   }
-  return NextResponse.json({ booking: apiBooking(booking, service.name) });
+  return NextResponse.json({ booking: apiBooking(booking, service!.name) });
 });

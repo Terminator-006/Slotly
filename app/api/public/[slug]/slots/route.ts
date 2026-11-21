@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
+import { and, eq } from "drizzle-orm";
 import { ApiError, rateLimited, readQuery, routeWithParams } from "@/lib/api";
 import { getFreeSlots } from "@/lib/bookings";
-import { getDb, NO_ID } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { clientIp, limiters } from "@/lib/ratelimit";
+import { businesses, services } from "@/lib/schema";
 import { slotsQuerySchema } from "@/lib/validators";
 
 export const runtime = "nodejs";
@@ -16,9 +18,13 @@ export const GET = routeWithParams<{ slug: string }>(async (req, { slug }) => {
   const { serviceId, date } = readQuery(req, slotsQuerySchema);
   const db = await getDb();
 
-  const business = await db.businesses.findOne({ slug }, NO_ID);
+  const [business] = await db.select().from(businesses).where(eq(businesses.slug, slug)).limit(1);
   if (!business) throw new ApiError(404, "not_found", "Business not found");
-  const service = await db.services.findOne({ _id: serviceId, businessId: business.id, active: true }, NO_ID);
+  const [service] = await db
+    .select()
+    .from(services)
+    .where(and(eq(services.id, serviceId), eq(services.businessId, business.id), eq(services.active, true)))
+    .limit(1);
   if (!service) throw new ApiError(404, "service_not_found", "Service not found");
 
   const slots = (await getFreeSlots(db, business, service, date)).map((s) => ({

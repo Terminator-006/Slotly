@@ -1,11 +1,12 @@
 import bcrypt from "bcryptjs";
 import { createHash } from "node:crypto";
-import { insertRow, isDuplicateKeyError, type DB, type Doc } from "./db";
-import type { Collection } from "mongodb";
+import { eq } from "drizzle-orm";
+import type { DB } from "./db";
+import { availability, businesses, services, users } from "./schema";
 
 /**
  * Deterministic, UUID-shaped ids for demo rows. Seeding is therefore idempotent: running it
- * twice (or from two serverless instances at once) can only ever produce the same documents.
+ * twice (or from two serverless instances at once) can only ever produce the same rows.
  */
 function demoId(name: string): string {
   const h = createHash("sha1").update(`slotly-demo:${name}`).digest("hex");
@@ -29,69 +30,50 @@ export function defaultDemoWindows() {
   return rows;
 }
 
-/** Insert unless a document with that id already exists. */
-async function insertIfAbsent<T extends { id: string }>(col: Collection<Doc<T>>, row: T): Promise<boolean> {
-  try {
-    await insertRow(col, row);
-    return true;
-  } catch (e) {
-    if (isDuplicateKeyError(e)) return false;
-    throw e;
-  }
-}
-
 /**
  * Ensure the demo business exists and is complete. Returns true if this call created the
- * business. Safe to call concurrently and repeatedly.
+ * business. Safe to call repeatedly and concurrently (every insert is ON CONFLICT DO NOTHING).
  */
 export async function seedDemo(db: DB): Promise<boolean> {
   const now = Date.now();
   const businessId = demoId("business");
+  const passwordHash = await bcrypt.hash(DEMO.password, 10);
 
-  // A real business already using the demo slug (different id) is left alone.
-  const created = await insertIfAbsent(db.businesses, {
-    id: businessId,
-    name: "Fade & Co Barbers",
-    slug: DEMO.slug,
-    timezone: "Europe/Berlin",
-    currency: "EUR",
-    createdAt: now,
+  return db.transaction(async (tx) => {
+    const created = await tx
+      .insert(businesses)
+      .values({ id: businessId, name: "Fade & Co Barbers", slug: DEMO.slug, timezone: "Europe/Berlin", currency: "EUR", createdAt: now })
+      .onConflictDoNothing()
+      .returning({ id: businesses.id });
+
+    await tx
+      .insert(users)
+      .values({ id: demoId("owner"), businessId, email: DEMO.email, passwordHash, role: "owner", createdAt: now })
+      .onConflictDoNothing();
+
+    const catalogue = [
+      { name: "Classic haircut", durationMin: 30, priceCents: 2500 },
+      { name: "Skin fade", durationMin: 45, priceCents: 3200 },
+      { name: "Beard trim", durationMin: 20, priceCents: 1500 },
+      { name: "Cut + beard combo", durationMin: 60, priceCents: 4200 },
+    ];
+    // createdAt is offset per row so the services keep their order when sorted by it.
+    await tx
+      .insert(services)
+      .values(catalogue.map((s, i) => ({ id: demoId(`service:${s.name}`), businessId, ...s, active: true, createdAt: now + i })))
+      .onConflictDoNothing();
+
+    await tx
+      .insert(availability)
+      .values(defaultDemoWindows().map((w) => ({ id: demoId(`window:${w.weekday}:${w.startMin}`), businessId, ...w })))
+      .onConflictDoNothing();
+
+    return created.length > 0;
   });
-
-  await insertIfAbsent(db.users, {
-    id: demoId("owner"),
-    businessId,
-    email: DEMO.email,
-    passwordHash: await bcrypt.hash(DEMO.password, 10),
-    role: "owner",
-    createdAt: now,
-  });
-
-  const catalogue = [
-    { name: "Classic haircut", durationMin: 30, priceCents: 2500 },
-    { name: "Skin fade", durationMin: 45, priceCents: 3200 },
-    { name: "Beard trim", durationMin: 20, priceCents: 1500 },
-    { name: "Cut + beard combo", durationMin: 60, priceCents: 4200 },
-  ];
-  // createdAt is offset per row so the services keep their order when sorted by it.
-  for (const [i, s] of catalogue.entries()) {
-    await insertIfAbsent(db.services, {
-      id: demoId(`service:${s.name}`),
-      businessId,
-      ...s,
-      active: true,
-      createdAt: now + i,
-    });
-  }
-
-  for (const w of defaultDemoWindows()) {
-    await insertIfAbsent(db.availability, { id: demoId(`window:${w.weekday}:${w.startMin}`), businessId, ...w });
-  }
-  return created;
 }
 
-/** Make sure the demo exists (cheap check first, so normal requests pay one indexed lookup once per process). */
+/** Make sure the demo exists (one cheap indexed lookup per process once it does). */
 export async function seedDemoIfMissing(db: DB): Promise<void> {
-  const exists = await db.businesses.findOne({ _id: demoId("business") }, { projection: { _id: 1 } });
+  const [exists] = await db.select({ id: businesses.id }).from(businesses).where(eq(businesses.id, demoId("business"))).limit(1);
   if (!exists) await seedDemo(db);
 }

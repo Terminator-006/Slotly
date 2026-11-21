@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, inject, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { DateTime } from "luxon";
 
@@ -15,9 +15,9 @@ type Module = Partial<Record<"GET" | "POST" | "PUT" | "PATCH" | "DELETE", Handle
 const routes: Record<string, Module> = {};
 
 beforeAll(async () => {
-  // Point the app at the test MongoDB, in a database of its own.
-  process.env.MONGODB_URI = inject("mongoUri");
-  process.env.MONGODB_DB = `slotly_api_test_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  // Hand the route handlers a private in-memory Postgres (PGlite) through the same cache getDb() uses.
+  const { createPgliteDb } = await import("../lib/db");
+  (globalThis as { __slotlyDb?: Promise<unknown> }).__slotlyDb = createPgliteDb();
   vi.spyOn(console, "log").mockImplementation(() => {}); // silence ConsoleMailer
   routes.signup = await import("../app/api/auth/signup/route");
   routes.login = await import("../app/api/auth/login/route");
@@ -34,9 +34,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   const { getDb } = await import("../lib/db");
-  const db = await getDb();
-  await db.db.dropDatabase();
-  await db.client.close();
+  const { closeDb } = await import("../lib/db");
+  await closeDb(await getDb());
+  (globalThis as { __slotlyDb?: unknown }).__slotlyDb = undefined;
 });
 
 function call(

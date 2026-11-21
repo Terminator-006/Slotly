@@ -5,9 +5,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
-    globalSetup: ["tests/global-setup.ts"],
     testTimeout: 20_000,
-    hookTimeout: 120_000, // first run downloads the mongod binary
+    hookTimeout: 60_000, // PGlite boots a WASM Postgres per database
   },
   resolve: {
     alias: { "@": fileURLToPath(new URL(".", import.meta.url)) },

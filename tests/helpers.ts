@@ -1,40 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, inject } from "vitest";
-import { createDb, insertRow, insertRows, type DB } from "../lib/db";
-import type { Business, Service } from "../lib/schema";
+import { afterAll } from "vitest";
+import { closeDb, createPgliteDb, type DB } from "../lib/db";
+import { availability, businesses, services, type Business, type Service } from "../lib/schema";
 
 export const utc = (iso: string) => Date.parse(iso);
 
-export const mongoUri = () => inject("mongoUri");
-
 const opened: DB[] = [];
 
-/** A brand-new, uniquely named database (indexes included). Dropped after the test file. */
-export async function freshDb(name = `slotly_test_${randomUUID().replace(/-/g, "")}`): Promise<DB> {
-  const db = await createDb(mongoUri(), name);
+/** A brand-new in-memory Postgres (PGlite) with the real schema and constraints applied. */
+export async function freshDb(): Promise<DB> {
+  const db = await createPgliteDb();
   opened.push(db);
   return db;
 }
 
-/** Another connection to an existing test database, like a second server instance. */
-export async function connectAgain(db: DB): Promise<DB> {
-  const again = await createDb(mongoUri(), db.db.databaseName);
-  opened.push(again);
-  return again;
-}
-
-/** Drop every database opened through freshDb and close all connections. Register once per file. */
+/** Close every database opened through freshDb. Register once per test file. */
 export function cleanupDbsAfterAll() {
   afterAll(async () => {
-    const dropped = new Set<string>();
-    for (const db of opened) {
-      const name = db.db.databaseName;
-      if (!dropped.has(name)) {
-        dropped.add(name);
-        await db.db.dropDatabase().catch(() => {});
-      }
-      await db.client.close().catch(() => {});
-    }
+    await Promise.all(opened.map((db) => closeDb(db).catch(() => {})));
     opened.length = 0;
   });
 }
@@ -53,7 +36,7 @@ export async function setupBusiness(dbOrUndefined?: DB, slug = "test-shop") {
     currency: "EUR",
     createdAt: 0,
   };
-  await insertRow(db.businesses, business);
+  await db.insert(businesses).values(business);
 
   const mk = (name: string, durationMin: number): Service => ({
     id: randomUUID(),
@@ -66,8 +49,8 @@ export async function setupBusiness(dbOrUndefined?: DB, slug = "test-shop") {
   });
   const hour = mk("Haircut", 60);
   const half = mk("Quick trim", 30);
-  await insertRows(db.services, [hour, half]);
-  await insertRow(db.availability, { id: randomUUID(), businessId: business.id, weekday: 1, startMin: 540, endMin: 1020 });
+  await db.insert(services).values([hour, half]);
+  await db.insert(availability).values({ id: randomUUID(), businessId: business.id, weekday: 1, startMin: 540, endMin: 1020 });
 
   return { db, business, hour, half };
 }

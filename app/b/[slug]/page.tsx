@@ -1,9 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { and, asc, eq } from "drizzle-orm";
 import BookingWidget from "@/components/BookingWidget";
 import { Logo } from "@/components/ui";
-import { getDb, NO_ID } from "@/lib/db";
+import { getDb } from "@/lib/db";
+import { businesses, services } from "@/lib/schema";
 import { apiBusiness, apiService } from "@/lib/serialize";
 
 export const dynamic = "force-dynamic";
@@ -12,9 +14,13 @@ type Props = { params: Promise<{ slug: string }> };
 
 async function load(slug: string) {
   const db = await getDb();
-  const business = await db.businesses.findOne({ slug }, NO_ID);
+  const [business] = await db.select().from(businesses).where(eq(businesses.slug, slug)).limit(1);
   if (!business) return null;
-  const rows = await db.services.find({ businessId: business.id, active: true }, NO_ID).sort({ createdAt: 1 }).toArray();
+  const rows = await db
+    .select()
+    .from(services)
+    .where(and(eq(services.businessId, business.id), eq(services.active, true)))
+    .orderBy(asc(services.createdAt));
   return { business, services: rows };
 }
 

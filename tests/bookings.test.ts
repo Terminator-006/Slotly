@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { cancelBooking, createBooking, getFreeSlots, listBookings } from "../lib/bookings";
-import { insertRow, isDuplicateKeyError } from "../lib/db";
-import type { Booking } from "../lib/schema";
-import { cleanupDbsAfterAll, connectAgain, NOW, setupBusiness, utc } from "./helpers";
+import { and, eq } from "drizzle-orm";
+import { isExclusionViolation } from "../lib/db";
+import { bookings, type Booking } from "../lib/schema";
+import { cleanupDbsAfterAll, NOW, setupBusiness, utc } from "./helpers";
 
 cleanupDbsAfterAll();
 
@@ -21,7 +22,11 @@ function book(ctx: Ctx, service: "hour" | "half", startsAt: number, name = "Ada"
   });
 }
 
-const lockCount = (ctx: Ctx) => ctx.db.locks.countDocuments({ businessId: ctx.business.id });
+const confirmed = (ctx: Ctx) =>
+  ctx.db
+    .select()
+    .from(bookings)
+    .where(and(eq(bookings.businessId, ctx.business.id), eq(bookings.status, "confirmed")));
 
 describe("createBooking: happy path", () => {
   it("books a free slot and removes it from the free list", async () => {
@@ -41,11 +46,6 @@ describe("createBooking: happy path", () => {
     expect(after).toHaveLength(7);
   });
 
-  it("holds one lock per minute of the appointment", async () => {
-    const ctx = await setupBusiness();
-    await book(ctx, "hour", TEN);
-    expect(await lockCount(ctx)).toBe(60);
-  });
 });
 
 describe("createBooking: double-booking protection", () => {
@@ -75,19 +75,9 @@ describe("createBooking: double-booking protection", () => {
     const first = await book(ctx, "hour", TEN);
     if (!first.ok) throw new Error("setup failed");
     expect((await cancelBooking(ctx.db, ctx.business.id, first.booking.id))?.status).toBe("cancelled");
-    expect(await lockCount(ctx)).toBe(0);
     expect((await book(ctx, "hour", TEN, "Grace")).ok).toBe(true);
   });
 
-  it("works across separate connections to the same database", async () => {
-    // Two server instances sharing one database: the second must see the first one's write.
-    const a = await setupBusiness();
-    const dbB = await connectAgain(a.db);
-    const first = await createBooking(a.db, { business: a.business, service: a.hour, startsAt: TEN, customerName: "A", customerEmail: "a@x.io", now: NOW });
-    const second = await createBooking(dbB, { business: a.business, service: a.hour, startsAt: TEN, customerName: "B", customerEmail: "b@x.io", now: NOW });
-    expect(first.ok).toBe(true);
-    expect(second).toEqual({ ok: false, reason: "slot_taken" });
-  });
 });
 
 describe("createBooking: real concurrency", () => {
@@ -96,8 +86,7 @@ describe("createBooking: real concurrency", () => {
     const results = await Promise.all(Array.from({ length: 12 }, (_, i) => book(ctx, "hour", TEN, `User${i}`)));
     expect(results.filter((r) => r.ok)).toHaveLength(1);
     expect(results.filter((r) => !r.ok && r.reason === "slot_taken")).toHaveLength(11);
-    expect(await ctx.db.bookings.countDocuments({ businessId: ctx.business.id, status: "confirmed" })).toBe(1);
-    expect(await lockCount(ctx)).toBe(60); // losers gave everything back
+    expect(await confirmed(ctx)).toHaveLength(1);
   });
 
   it("never lets overlapping bookings of different lengths both succeed", async () => {
@@ -112,87 +101,58 @@ describe("createBooking: real concurrency", () => {
     const winners = results.filter((r) => r.ok);
     // Either the hour wins alone, or the two halves win together; never an overlap.
     expect([1, 2]).toContain(winners.length);
-    const confirmed = await ctx.db.bookings.find({ businessId: ctx.business.id, status: "confirmed" }).toArray();
-    const sorted = [...confirmed].sort((x, y) => x.startsAt - y.startsAt);
+    const sorted = [...(await confirmed(ctx))].sort((x, y) => x.startsAt - y.startsAt);
     for (let i = 1; i < sorted.length; i++) expect(sorted[i]!.startsAt).toBeGreaterThanOrEqual(sorted[i - 1]!.endsAt);
   });
 });
 
-describe("createBooking: stale locks do not wedge a slot", () => {
-  const lockDoc = (businessId: string, bookingId: string, createdAt: number) => {
-    const first = Math.floor(TEN / 60_000);
-    return Array.from({ length: 60 }, (_, i) => ({
-      _id: `${businessId}:${first + i}`,
-      businessId,
-      bookingId,
-      createdAt,
-      expireAt: new Date(TEN + 86_400_000),
-    }));
-  };
-
-  it("reclaims locks left behind by a cancelled booking", async () => {
-    const ctx = await setupBusiness();
-    const ghostId = randomUUID();
-    const ghost: Booking = {
-      id: ghostId,
-      businessId: ctx.business.id,
-      serviceId: ctx.hour.id,
-      customerName: "Ghost",
-      customerEmail: "g@x.io",
-      startsAt: TEN,
-      endsAt: TEN + 3_600_000,
-      status: "cancelled",
-      createdAt: 0,
-    };
-    await insertRow(ctx.db.bookings, ghost);
-    await ctx.db.locks.insertMany(lockDoc(ctx.business.id, ghostId, Date.now()));
-    expect((await book(ctx, "hour", TEN)).ok).toBe(true);
-  });
-
-  it("reclaims orphan locks (no booking was ever written) once the grace period has passed", async () => {
-    const ctx = await setupBusiness();
-    await ctx.db.locks.insertMany(lockDoc(ctx.business.id, randomUUID(), Date.now() - 60_000));
-    expect((await book(ctx, "hour", TEN)).ok).toBe(true);
-  });
-
-  it("still honours a fresh in-flight claim", async () => {
-    const ctx = await setupBusiness();
-    await ctx.db.locks.insertMany(lockDoc(ctx.business.id, randomUUID(), Date.now()));
-    expect(await book(ctx, "hour", TEN)).toEqual({ ok: false, reason: "slot_taken" });
-    expect(await lockCount(ctx)).toBe(60); // the other claim's locks are untouched
-  });
-});
-
-describe("createBooking: the unique index is a real safety net", () => {
-  const row = (businessId: string, serviceId: string, status: "confirmed" | "cancelled"): Booking => ({
+describe("createBooking: the EXCLUDE constraint is the real guarantee", () => {
+  const row = (ctx: Ctx, startsAt: number, endsAt: number, status: "confirmed" | "cancelled" = "confirmed"): Booking => ({
     id: randomUUID(),
-    businessId,
-    serviceId,
+    businessId: ctx.business.id,
+    serviceId: ctx.hour.id,
     customerName: "X",
     customerEmail: "x@x.io",
-    startsAt: TEN,
-    endsAt: TEN + 3_600_000,
+    startsAt,
+    endsAt,
     status,
     createdAt: 0,
   });
-
-  it("blocks two confirmed rows with the same start even if the lock layer is bypassed", async () => {
-    const { db, business, hour } = await setupBusiness();
-    await insertRow(db.bookings, row(business.id, hour.id, "confirmed"));
-    let error: unknown;
+  const attempt = async (ctx: Ctx, b: Booking) => {
     try {
-      await insertRow(db.bookings, row(business.id, hour.id, "confirmed"));
+      await ctx.db.insert(bookings).values(b);
+      return undefined;
     } catch (e) {
-      error = e;
+      return e;
     }
-    expect(isDuplicateKeyError(error)).toBe(true);
+  };
+
+  it("rejects an identical confirmed range even when the app-level check is bypassed", async () => {
+    const ctx = await setupBusiness();
+    expect(await attempt(ctx, row(ctx, TEN, TEN + 3_600_000))).toBeUndefined();
+    expect(isExclusionViolation(await attempt(ctx, row(ctx, TEN, TEN + 3_600_000)))).toBe(true);
   });
 
-  it("does not block a cancelled row sharing the start time", async () => {
-    const { db, business, hour } = await setupBusiness();
-    await insertRow(db.bookings, row(business.id, hour.id, "cancelled"));
-    await insertRow(db.bookings, row(business.id, hour.id, "confirmed"));
-    expect(await listBookings(db, business.id, "all", NOW)).toHaveLength(2);
+  it("rejects a partial overlap (different start) too, which a plain unique index could not", async () => {
+    const ctx = await setupBusiness();
+    await attempt(ctx, row(ctx, TEN, TEN + 3_600_000)); // 10:00-11:00
+    const err = await attempt(ctx, row(ctx, TEN + 30 * 60_000, TEN + 90 * 60_000)); // 10:30-11:30
+    expect(isExclusionViolation(err)).toBe(true);
+  });
+
+  it("does not block a cancelled row, and back-to-back ranges are fine", async () => {
+    const ctx = await setupBusiness();
+    await attempt(ctx, row(ctx, TEN, TEN + 3_600_000, "cancelled"));
+    expect(await attempt(ctx, row(ctx, TEN, TEN + 3_600_000))).toBeUndefined();
+    expect(await attempt(ctx, row(ctx, TEN + 3_600_000, TEN + 7_200_000))).toBeUndefined(); // adjacent
+    expect(await listBookings(ctx.db, ctx.business.id, "all", NOW)).toHaveLength(3);
+  });
+
+  it("scopes the constraint per business", async () => {
+    const a = await setupBusiness();
+    const b = await setupBusiness(a.db, "other-shop");
+    expect(await attempt(a, row(a, TEN, TEN + 3_600_000))).toBeUndefined();
+    expect(await attempt(b, row(b, TEN, TEN + 3_600_000))).toBeUndefined();
   });
 });
 
@@ -207,7 +167,6 @@ describe("createBooking: invalid requests", () => {
   ])("%s -> slot_unavailable", async (_label, startsAt) => {
     const ctx = await setupBusiness();
     expect(await book(ctx, "hour", startsAt)).toEqual({ ok: false, reason: "slot_unavailable" });
-    expect(await lockCount(ctx)).toBe(0);
   });
 });
 
@@ -230,7 +189,6 @@ describe("tenant isolation", () => {
     expect(await cancelBooking(a.db, b.business.id, made.booking.id)).toBeNull();
     expect(await listBookings(a.db, b.business.id, "all", NOW)).toHaveLength(0);
     expect(await listBookings(a.db, a.business.id, "all", NOW)).toHaveLength(1);
-    expect(await lockCount(a)).toBe(60); // the failed cross-tenant cancel freed nothing
   });
 
   it("two businesses can book the same instant independently", async () => {

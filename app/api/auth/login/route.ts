@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
+import { eq } from "drizzle-orm";
 import { ApiError, rateLimited, readJson, route } from "@/lib/api";
 import { DUMMY_HASH, SESSION_COOKIE, sessionCookieOptions, signSession, verifyPassword } from "@/lib/auth";
-import { getDb, NO_ID } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { clientIp, limiters } from "@/lib/ratelimit";
+import { businesses, users } from "@/lib/schema";
 import { apiBusiness, apiUser } from "@/lib/serialize";
 import { loginSchema } from "@/lib/validators";
 
@@ -15,15 +17,15 @@ export const POST = route(async (req) => {
 
   const { email, password } = await readJson(req, loginSchema);
   const db = await getDb();
-  const user = await db.users.findOne({ email }, NO_ID);
+  const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
 
   // Always run one bcrypt comparison, even for unknown emails, so timing doesn't reveal
   // which addresses have accounts. One generic message for both failure modes, too.
   const valid = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
   if (!user || !valid) throw new ApiError(401, "invalid_credentials", "Invalid email or password");
 
-  const business = (await db.businesses.findOne({ _id: user.businessId }, NO_ID))!;
-  const res = NextResponse.json({ user: apiUser(user), business: apiBusiness(business) });
+  const [business] = await db.select().from(businesses).where(eq(businesses.id, user.businessId)).limit(1);
+  const res = NextResponse.json({ user: apiUser(user), business: apiBusiness(business!) });
   res.cookies.set(SESSION_COOKIE, await signSession(user.id), sessionCookieOptions());
   return res;
 });
