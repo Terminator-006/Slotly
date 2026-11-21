@@ -12,3 +12,7 @@ next-env.d.ts
 coverage/
 .vercel/
 .DS_Store
+
+# personal notes, kept locally
+INTERVIEW_NOTES.md
+Claude outputs/

@@ -4,7 +4,19 @@
 
 Multi-tenant appointment booking for small businesses (barbers, clinics, tutors). A business signs up, lists its services and weekly hours, and shares one link; customers pick a service, a day and a time, and book without an account.
 
-The interesting parts are the ones that are easy to get subtly wrong: **timezone/DST-correct slot generation** and **double-booking protection**. Both are covered by tests (103 of them, including DST spring-forward and fall-back days and a parallel-request race).
+The interesting parts are the ones that are easy to get subtly wrong: **timezone/DST-correct slot generation** and **double-booking protection**. Both are covered by tests (100 of them, including DST spring-forward and fall-back days and a parallel-request race).
+
+## Live demo
+
+**https://slotly-pied.vercel.app**
+
+| Try | Where |
+| --- | --- |
+| Book as a customer | https://slotly-pied.vercel.app/b/demo-barber |
+| Owner dashboard | https://slotly-pied.vercel.app/login with `demo@slotly.dev` / `demo1234` |
+| Your own business | https://slotly-pied.vercel.app/signup |
+
+It runs on Vercel with a Postgres database on Neon. Booking and cancellation send real confirmation emails. This is a public demo, so the data may be reset at any time; please don't enter anything sensitive.
 
 <p>
   <img src="docs/screenshots/booking-page.png" alt="Public booking page" width="48%">
