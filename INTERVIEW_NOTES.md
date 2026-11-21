@@ -6,13 +6,13 @@ Talking points and likely questions. Everything here is true of the code in this
 
 ## 30-second pitch
 
-> Slotly is a multi-tenant booking app: a small business signs up, sets services and weekly hours, and shares a link; customers book without an account. I built it to get the hard parts right rather than the feature count: slot generation that's correct across timezones and DST, and booking that can't double-book even under concurrent requests. It's Next.js and TypeScript with Drizzle on SQLite, 89 tests, CI on every push.
+> Slotly is a multi-tenant booking app: a small business signs up, sets services and weekly hours, and shares a link; customers book without an account. I built it to get the hard parts right rather than the feature count: slot generation that's correct across timezones and DST, and booking that can't double-book even under concurrent requests. It's Next.js and TypeScript on MongoDB, 103 tests, CI on every push.
 
 ## 2-minute walkthrough (what to click, what to say)
 
 1. **`/b/demo-barber`**: pick a service, a day, a slot. "Times are in the shop's timezone; if you're elsewhere it tells you your local time."
 2. **`lib/slots.ts`**: "Pure function: windows minus busy spans. No I/O, which is why it's easy to test, including DST."
-3. **`lib/bookings.ts` → `createBooking`**: "Immediate transaction, recompute free slots inside the lock, insert. Unique index as the safety net."
+3. **`lib/bookings.ts` → `createBooking`**: "Validate server-side, then atomically claim one lock document per minute. `_id` uniqueness is the mutual exclusion. Unique index as the safety net."
 4. **`tests/slots.test.ts`**: scroll to the spring-forward and fall-back tests.
 5. **Dashboard**: log in as the owner, cancel a booking (email appears in the server log).
 
@@ -21,16 +21,22 @@ Talking points and likely questions. Everything here is true of the code in this
 ## Concurrency and double-booking
 
 **Q: How do you stop two people booking the same slot?**
-Two layers. First, `createBooking` runs in a `BEGIN IMMEDIATE` transaction. SQLite takes the write lock up front, so two writers can't both read "free" and then both insert. Inside the lock I re-derive that day's free slots from scratch and only insert if the requested start is still among them. Second, a partial unique index on `(business_id, starts_at) WHERE status = 'confirmed'` rejects an exact duplicate even if some future code path skips the check. The loser gets `409 slot_taken` and the UI refreshes the slot list.
+Three steps. (1) Validate: I re-derive that day's free slots server-side and check the requested start is among them, so off-grid or closed-hours requests never get further. (2) Claim: booking 10:00-11:00 inserts one lock document per minute, with `_id = businessId:minuteIndex`. MongoDB enforces `_id` uniqueness atomically, so two overlapping requests can't both get every minute; the loser's partial inserts are undone and it gets `409 slot_taken`, and the UI refreshes the slot list. (3) Write the booking document. A partial unique index on `(businessId, startsAt) WHERE status = 'confirmed'` is a safety net behind that. I avoided multi-document transactions on purpose, so it runs on a standalone `mongod` and the free Atlas tier.
 
 **Q: Why isn't the unique index enough?**
-It only catches identical start times. A 60-minute booking at 10:00 and a 30-minute booking at 10:30 have different starts but overlap. That needs an overlap check. There's a test for exactly that case.
+It only catches identical start times. A 60-minute booking at 10:00 and a 30-minute booking at 10:30 have different starts but overlap. That's what the per-minute locks are for: the two bookings share a minute, and `_id` uniqueness makes that conflict atomic. There's a test for exactly that case.
 
 **Q: What would you do on Postgres?**
-`SELECT ... FOR UPDATE` on the business row (or `pg_advisory_xact_lock`) before the check, inside a transaction. Better still, push the invariant into the database with an exclusion constraint: `EXCLUDE USING gist (business_id WITH =, tstzrange(starts_at, ends_at) WITH &&) WHERE (status = 'confirmed')`. Then overlap is impossible at the data layer, not just unlikely at the app layer.
+I'd use a real constraint instead of lock documents: `SELECT ... FOR UPDATE` on the business row (or `pg_advisory_xact_lock`) inside a transaction, and better still push the invariant into the database with an exclusion constraint: `EXCLUDE USING gist (business_id WITH =, tstzrange(starts_at, ends_at) WITH &&) WHERE (status = 'confirmed')`. Then overlap is impossible at the data layer, not just unlikely at the app layer.
 
 **Q: Your tests are single-process. How do you know the lock works?**
-Honest answer: `better-sqlite3` is synchronous, so inside one process requests can't interleave mid-transaction anyway. The lock matters across processes or instances. I have a test that opens two connections to the same database file and shows the second sees the first's write, and a test that bypasses the app check to prove the unique index fires. I haven't load-tested true parallel writers; that'd be the next step (a script that fires N parallel `curl`s at the same slot against a multi-worker server and asserts exactly one 201).
+There's a test that fires 12 simultaneous `createBooking` calls for the same slot against a real MongoDB and asserts exactly one wins and the other 11 get `slot_taken`, plus one that races bookings of different lengths and asserts no two confirmed bookings overlap. Another opens two separate connections, like two server instances, and a third bypasses the lock layer to prove the unique index fires. What I haven't done is load-test across several app processes over HTTP; that would be the next step (N parallel `curl`s at one slot against a multi-instance deployment, asserting exactly one 201).
+
+**Q: What if the process crashes halfway through a booking?**
+Two crash windows, both handled. If it dies after claiming the locks but before writing the booking, the orphan locks block that slot; a later claim sees locks whose booking doesn't exist and are older than a 15-second grace period, deletes them and retries. If it dies during cancel, I mark the booking cancelled first and free the locks second, so the worst case is leftover locks on a cancelled booking, which the same reclaim logic removes. The reverse order could leave a confirmed booking with no locks, which is the dangerous one. A TTL index also garbage-collects old locks.
+
+**Q: Why MongoDB for this?**
+Honestly it's a relational problem and Postgres would give me an exclusion constraint and transactions for free. I chose Mongo for a managed free tier that every serverless instance can share, and because it let me show I can build the exclusion guarantee myself on a store that lacks it. The cost is application code I have to maintain and test (the locks and the manual cleanup in signup), and I'd say so before being asked.
 
 **Q: What about the user double-clicking submit?**
 The button is disabled while submitting, and if two requests did arrive, the second gets 409. A client-supplied idempotency key would make the retry return the original booking instead; that's on the roadmap (it's the same mechanism payments would need).
@@ -62,7 +68,7 @@ Reliable IANA zone handling and explicit DST resolution rules. The built-in `Dat
 Signup/login validates input with Zod, hashes with bcrypt (cost 10), and issues an HS256 JWT in an `httpOnly`, `SameSite=Lax`, `Secure`-in-production cookie, 7-day expiry. The token holds only the user id.
 
 **Q: Why not put the role in the token?**
-Because then a removed or demoted user keeps their access until it expires. On every request I verify the token, then load the user and business from the database, so revocation is immediate. The cost is one indexed primary-key lookup per request, which is trivial on SQLite. If that mattered at scale I'd cache briefly or add a token version.
+Because then a removed or demoted user keeps their access until it expires. On every request I verify the token, then load the user and business from the database, so revocation is immediate. The cost is one indexed primary-key lookup per request, which is trivial on MongoDB too. If that mattered at scale I'd cache briefly or add a token version.
 
 **Q: Why not localStorage?**
 Any XSS can read localStorage. An `httpOnly` cookie isn't readable from JavaScript. The trade-off is CSRF, which I handle with `SameSite=Lax` plus an `Origin` check on state-changing requests.
@@ -107,26 +113,26 @@ Rate limiting, the 60-day horizon, and email confirmation to the address provide
 ## Scaling
 
 **Q: What breaks first?**
-1. SQLite as a single writer, and the per-instance filesystem on serverless. Move to Postgres.
+1. Lock-document volume (one per booked minute; TTL keeps it bounded) and the lack of multi-document transactions in signup. Moving to Postgres with an exclusion constraint removes both.
 2. The in-memory rate limiter. Move to Redis.
 3. Email sent inline in the request. Move to a queue/outbox so a slow provider doesn't slow bookings.
 4. The slots endpoint recomputes per request. It's one indexed range query plus an in-memory loop, so it's cheap; if it weren't, cache per `(business, service, date)` and invalidate on booking.
 
 **Q: Indexes?**
-`bookings (business_id, starts_at)` for the day-range query and the partial unique index; `business_id` indexes on services, availability and users; unique on `users.email` and `businesses.slug`.
+`bookings (businessId, startsAt)` for the day-range query, plus the partial unique index on confirmed bookings; compound indexes starting with `businessId` on services, availability and users; unique on `users.email` and `businesses.slug`; a TTL index on lock documents. All created idempotently in `lib/db.ts`.
 
-**Q: Why SQLite at all?**
-Zero-setup: `git clone && npm run dev` works, which matters for a portfolio and for reviewers. Drizzle plus portable column types keeps the move to Postgres small. The honest cost is described above.
+**Q: Why not SQLite, which you started with?**
+I did start with SQLite (zero setup, and `BEGIN IMMEDIATE` made the concurrency story simple), but on serverless each instance has its own ephemeral disk, so a hosted demo behaved inconsistently: a service id returned by one instance could 404 on another. A shared managed database fixes that, which is why it moved to MongoDB Atlas.
 
 ---
 
 ## Testing
 
 **Q: What's your testing strategy?**
-The core logic is pure (`slots.ts`), so most coverage is fast unit tests with an injected clock. On top of that, DB-backed tests with `:memory:` SQLite for the booking transaction, and an API test that calls the real Next route handlers (no HTTP server) for the whole flow. Auth tests include tampered, expired, wrong-secret and `alg=none` tokens.
+The core logic is pure (`slots.ts`), so most coverage is fast unit tests with an injected clock. On top of that, DB-backed tests against a throwaway in-memory MongoDB (each test gets its own database) for the booking logic and its concurrency, and an API test that calls the real Next route handlers (no HTTP server) for the whole flow. Auth tests include tampered, expired, wrong-secret and `alg=none` tokens.
 
 **Q: What's not tested?**
-React components and a browser end-to-end flow. I drove the UI manually with a headless browser while building it, but there's no Playwright test in CI yet. True parallel-writer load testing is also missing.
+React components and a browser end-to-end flow. I drove the UI manually with a headless browser while building it, but there's no Playwright test in CI yet. Load testing across several app instances over HTTP is also missing.
 
 **Q: A bug your tests caught or you hit while building?**
 - A booking test I wrote for "in the past" used a timestamp that was actually an hour *in the future*; the code was right and my test data wrong. It made me add explicit tests for already-started slots and the exact minimum-notice boundary.
@@ -153,7 +159,7 @@ Storing opening hours as wall-clock minutes and bookings as UTC instants. It loo
 
 ## "What would you do differently?"
 
-Generate migrations from `schema.ts` with `drizzle-kit` instead of hand-written bootstrap SQL, pick Postgres from day one for anything deployed beyond a demo, and write the parallel-writers load test before claiming concurrency safety beyond what the tests show.
+Pick Postgres from day one for a domain this relational, and write the multi-instance load test before claiming concurrency safety beyond what the tests show.
 
 ## Questions to ask them
 

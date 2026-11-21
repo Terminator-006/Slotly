@@ -1,10 +1,9 @@
 import { cookies } from "next/headers";
 import type { NextRequest } from "next/server";
-import { eq } from "drizzle-orm";
 import { ApiError } from "./api";
 import { SESSION_COOKIE, verifySession } from "./auth";
-import { getDb, type DB } from "./db";
-import { businesses, users, type Business, type Role, type User } from "./schema";
+import { getDb, NO_ID, type DB } from "./db";
+import type { Business, Role, User } from "./schema";
 
 export interface AuthContext {
   db: DB;
@@ -17,10 +16,10 @@ async function resolve(token: string | undefined): Promise<AuthContext | null> {
   const claims = await verifySession(token);
   if (!claims) return null;
 
-  const db = getDb();
-  const user = db.select().from(users).where(eq(users.id, claims.sub)).get();
+  const db = await getDb();
+  const user = await db.users.findOne({ _id: claims.sub }, NO_ID);
   if (!user) return null; // deleted since the token was issued
-  const business = db.select().from(businesses).where(eq(businesses.id, user.businessId)).get();
+  const business = await db.businesses.findOne({ _id: user.businessId }, NO_ID);
   return business ? { db, user, business } : null;
 }
 

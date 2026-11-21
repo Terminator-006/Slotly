@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
-import { asc, eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { ApiError, readJson, route } from "@/lib/api";
 import { hashPassword } from "@/lib/auth";
-import { isConstraintError } from "@/lib/db";
+import { insertRow, isDuplicateKeyError, NO_ID } from "@/lib/db";
 import { requireAuth } from "@/lib/guard";
-import { users } from "@/lib/schema";
+import type { User } from "@/lib/schema";
 import { apiUser } from "@/lib/serialize";
 import { staffCreateSchema } from "@/lib/validators";
 
@@ -14,7 +13,7 @@ export const dynamic = "force-dynamic";
 
 export const GET = route(async (req) => {
   const { db, business } = await requireAuth(req, ["owner"]);
-  const rows = db.select().from(users).where(eq(users.businessId, business.id)).orderBy(asc(users.createdAt)).all();
+  const rows = await db.users.find({ businessId: business.id }, NO_ID).sort({ createdAt: 1 }).toArray();
   return NextResponse.json({ users: rows.map(apiUser) });
 });
 
@@ -23,18 +22,18 @@ export const POST = route(async (req) => {
   const { db, business } = await requireAuth(req, ["owner"]);
   const input = await readJson(req, staffCreateSchema);
 
-  const row = {
+  const row: User = {
     id: randomUUID(),
     businessId: business.id,
     email: input.email,
     passwordHash: await hashPassword(input.password),
-    role: "staff" as const,
+    role: "staff",
     createdAt: Date.now(),
   };
   try {
-    db.insert(users).values(row).run();
+    await insertRow(db.users, row);
   } catch (e) {
-    if (isConstraintError(e)) throw new ApiError(409, "email_taken", "An account with this email already exists");
+    if (isDuplicateKeyError(e)) throw new ApiError(409, "email_taken", "An account with this email already exists");
     throw e;
   }
   return NextResponse.json({ user: apiUser(row) }, { status: 201 });

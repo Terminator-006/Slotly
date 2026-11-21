@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import { and, eq } from "drizzle-orm";
 import { ApiError, readJson, routeWithParams } from "@/lib/api";
+import { NO_ID } from "@/lib/db";
 import { requireAuth } from "@/lib/guard";
-import { services } from "@/lib/schema";
 import { apiService } from "@/lib/serialize";
 import { servicePatchSchema } from "@/lib/validators";
 
@@ -14,11 +13,11 @@ export const PATCH = routeWithParams<{ id: string }>(async (req, { id }) => {
   const { db, business } = await requireAuth(req, ["owner"]);
   const patch = await readJson(req, servicePatchSchema);
 
-  // The businessId in the WHERE clause is the tenant boundary: you can only touch your own rows.
-  const where = and(eq(services.id, id), eq(services.businessId, business.id));
-  if (!db.select({ id: services.id }).from(services).where(where).get()) {
+  // The businessId in the filter is the tenant boundary: you can only touch your own rows.
+  const where = { _id: id, businessId: business.id };
+  if (!(await db.services.findOne(where, { projection: { _id: 1 } }))) {
     throw new ApiError(404, "not_found", "Service not found");
   }
-  db.update(services).set(patch).where(where).run();
-  return NextResponse.json({ service: apiService(db.select().from(services).where(where).get()!) });
+  await db.services.updateOne(where, { $set: patch });
+  return NextResponse.json({ service: apiService((await db.services.findOne(where, NO_ID))!) });
 });

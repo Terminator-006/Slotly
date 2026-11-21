@@ -1,11 +1,9 @@
 import { NextResponse } from "next/server";
-import { and, eq } from "drizzle-orm";
 import { ApiError, rateLimited, readJson, routeWithParams } from "@/lib/api";
 import { createBooking } from "@/lib/bookings";
-import { getDb } from "@/lib/db";
+import { getDb, NO_ID } from "@/lib/db";
 import { bookingConfirmedEmail, bookingOwnerAlertEmail, getMailer, safeSend } from "@/lib/mailer";
 import { clientIp, limiters } from "@/lib/ratelimit";
-import { businesses, services, users } from "@/lib/schema";
 import { apiBooking } from "@/lib/serialize";
 import { publicBookingSchema } from "@/lib/validators";
 
@@ -18,18 +16,14 @@ export const POST = routeWithParams<{ slug: string }>(async (req, { slug }) => {
   if (!rl.allowed) throw rateLimited(rl.retryAfterSec);
 
   const input = await readJson(req, publicBookingSchema);
-  const db = getDb();
+  const db = await getDb();
 
-  const business = db.select().from(businesses).where(eq(businesses.slug, slug)).get();
+  const business = await db.businesses.findOne({ slug }, NO_ID);
   if (!business) throw new ApiError(404, "not_found", "Business not found");
-  const service = db
-    .select()
-    .from(services)
-    .where(and(eq(services.id, input.serviceId), eq(services.businessId, business.id), eq(services.active, true)))
-    .get();
+  const service = await db.services.findOne({ _id: input.serviceId, businessId: business.id, active: true }, NO_ID);
   if (!service) throw new ApiError(404, "service_not_found", "Service not found");
 
-  const result = createBooking(db, {
+  const result = await createBooking(db, {
     business,
     service,
     startsAt: Date.parse(input.start),
@@ -46,11 +40,7 @@ export const POST = routeWithParams<{ slug: string }>(async (req, { slug }) => {
 
   const { booking } = result;
   const mailer = getMailer();
-  const owner = db
-    .select()
-    .from(users)
-    .where(and(eq(users.businessId, business.id), eq(users.role, "owner")))
-    .get();
+  const owner = await db.users.findOne({ businessId: business.id, role: "owner" }, NO_ID);
   await safeSend(mailer, bookingConfirmedEmail(booking, business, service));
   if (owner) await safeSend(mailer, bookingOwnerAlertEmail(owner.email, booking, business, service));
 

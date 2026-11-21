@@ -1,12 +1,8 @@
-import { and, asc, desc, eq, gt, lt, gte } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { DateTime } from "luxon";
-import { isConstraintError, type DB } from "./db";
-import { availability, bookings, services, type Booking, type Business, type Service } from "./schema";
+import { insertRow, isDuplicateKeyError, NO_ID, type DB } from "./db";
+import type { Booking, Business, Service } from "./schema";
 import { dayBounds, generateSlots, localDate, type Slot } from "./slots";
-
-/** Anything we can run queries on: the DB itself or a transaction handle. */
-type Executor = Pick<DB, "select" | "insert" | "update" | "delete">;
 
 export const BOOKING_RULES = {
   /** Customers cannot book a slot starting in less than this many minutes. */
@@ -15,29 +11,26 @@ export const BOOKING_RULES = {
   maxDaysAhead: 60,
 } as const;
 
-function windowsFor(db: Executor, businessId: string) {
-  return db
-    .select({ weekday: availability.weekday, startMin: availability.startMin, endMin: availability.endMin })
-    .from(availability)
-    .where(eq(availability.businessId, businessId))
-    .all();
+const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
+/** A lock whose booking never materialised is treated as abandoned after this long. */
+const ORPHAN_LOCK_GRACE_MS = 15_000;
+
+async function windowsFor(db: DB, businessId: string) {
+  return db.availability
+    .find({ businessId }, { projection: { _id: 0, weekday: 1, startMin: 1, endMin: 1 } })
+    .toArray();
 }
 
-function busyOn(db: Executor, businessId: string, date: string, timezone: string) {
+async function busyOn(db: DB, businessId: string, date: string, timezone: string) {
   const bounds = dayBounds(date, timezone);
   if (!bounds) return [];
-  return db
-    .select({ startsAt: bookings.startsAt, endsAt: bookings.endsAt })
-    .from(bookings)
-    .where(
-      and(
-        eq(bookings.businessId, businessId),
-        eq(bookings.status, "confirmed"),
-        lt(bookings.startsAt, bounds.end),
-        gt(bookings.endsAt, bounds.start),
-      ),
+  return db.bookings
+    .find(
+      { businessId, status: "confirmed", startsAt: { $lt: bounds.end }, endsAt: { $gt: bounds.start } },
+      { projection: { _id: 0, startsAt: 1, endsAt: 1 } },
     )
-    .all();
+    .toArray();
 }
 
 /** Is `date` inside the bookable horizon (today .. today + maxDaysAhead) in the business timezone? */
@@ -47,28 +40,99 @@ export function isDateBookable(date: string, timezone: string, now: number): boo
   return date >= today && date <= last; // ISO dates compare correctly as strings
 }
 
-function computeSlots(
-  db: Executor,
+async function computeSlots(
+  db: DB,
   business: Business,
   service: Service,
   date: string,
   now: number,
   opts: { ignoreBookings?: boolean } = {},
-): Slot[] {
+): Promise<Slot[]> {
   if (!isDateBookable(date, business.timezone, now)) return [];
+  const [windows, busy] = await Promise.all([
+    windowsFor(db, business.id),
+    opts.ignoreBookings ? Promise.resolve([]) : busyOn(db, business.id, date, business.timezone),
+  ]);
   return generateSlots({
     date,
     timezone: business.timezone,
     durationMin: service.durationMin,
-    windows: windowsFor(db, business.id),
-    busy: opts.ignoreBookings ? [] : busyOn(db, business.id, date, business.timezone),
+    windows,
+    busy,
     now,
     minNoticeMin: BOOKING_RULES.minNoticeMin,
   });
 }
 
-export function getFreeSlots(db: Executor, business: Business, service: Service, date: string, now = Date.now()): Slot[] {
+export function getFreeSlots(db: DB, business: Business, service: Service, date: string, now = Date.now()): Promise<Slot[]> {
   return computeSlots(db, business, service, date, now);
+}
+
+// ---------------------------------------------------------------------------------------
+// Atomic slot claiming
+//
+// MongoDB has no exclusion constraints and we deliberately avoid multi-document transactions,
+// so exclusivity comes from lock documents: one per minute of the appointment, with a
+// deterministic `_id` of `${businessId}:${minuteIndex}`. `_id` uniqueness is enforced
+// atomically by the server, so for any two overlapping bookings at least one insert fails.
+// ---------------------------------------------------------------------------------------
+
+function lockIds(businessId: string, startsAt: number, endsAt: number): string[] {
+  const first = Math.floor(startsAt / MINUTE);
+  const last = Math.ceil(endsAt / MINUTE) - 1; // half-open: [start, end)
+  const ids: string[] = [];
+  for (let m = first; m <= last; m++) ids.push(`${businessId}:${m}`);
+  return ids;
+}
+
+async function releaseLocks(db: DB, bookingId: string): Promise<void> {
+  await db.locks.deleteMany({ bookingId });
+}
+
+/**
+ * Remove locks that block a claim but belong to nothing live: their booking was cancelled
+ * (the process died between "mark cancelled" and "delete locks"), or their booking was never
+ * written (the process died between "claim" and "insert booking") and the grace period passed.
+ * Returns true if anything was cleared, i.e. a retry is worthwhile.
+ */
+async function clearStaleLocks(db: DB, ids: string[]): Promise<boolean> {
+  const blocking = await db.locks.find({ _id: { $in: ids } }).toArray();
+  if (blocking.length === 0) return true; // the blocker vanished in the meantime: retry
+
+  const owners = await db.bookings
+    .find({ _id: { $in: [...new Set(blocking.map((l) => l.bookingId))] } }, { projection: { _id: 1, status: 1 } })
+    .toArray();
+  const status = new Map(owners.map((o) => [o._id, o.status]));
+
+  const nowMs = Date.now();
+  const stale = blocking.filter((l) => {
+    const s = status.get(l.bookingId);
+    return s === "cancelled" || (s === undefined && nowMs - l.createdAt > ORPHAN_LOCK_GRACE_MS);
+  });
+  if (stale.length === 0) return false;
+  await db.locks.deleteMany({ _id: { $in: stale.map((l) => l._id) } });
+  return true;
+}
+
+/** Try to take every minute of [startsAt, endsAt). All-or-nothing; returns false if any is held. */
+async function claimSlot(db: DB, bookingId: string, businessId: string, startsAt: number, endsAt: number): Promise<boolean> {
+  const ids = lockIds(businessId, startsAt, endsAt);
+  const createdAt = Date.now();
+  const expireAt = new Date(endsAt + DAY);
+  const docs = ids.map((_id) => ({ _id, businessId, bookingId, createdAt, expireAt }));
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await db.locks.insertMany(docs, { ordered: false });
+      return true;
+    } catch (e) {
+      await releaseLocks(db, bookingId); // undo the minutes we did get
+      if (!isDuplicateKeyError(e)) throw e;
+      if (attempt === 0 && (await clearStaleLocks(db, ids))) continue;
+      return false;
+    }
+  }
+  return false;
 }
 
 export type CreateBookingInput = {
@@ -87,90 +151,100 @@ export type CreateBookingResult =
 /**
  * Create a booking without ever double-booking.
  *
- * 1. The transaction is `BEGIN IMMEDIATE`: it takes SQLite's write lock up front, so two
- *    requests cannot both read "free" and then both insert. The slot is re-derived
- *    from scratch *inside* the lock; we never trust the client's idea of what is free.
- * 2. A partial unique index (business_id, starts_at WHERE confirmed) is the safety net
- *    if anyone ever writes bookings through a path that skips step 1.
+ * 1. Validate: the requested start must be a slot the engine would offer right now (inside
+ *    opening hours, on the grid, past the minimum notice, not overlapping a confirmed booking).
+ *    We re-derive this server-side and never trust the client's idea of what is free.
+ * 2. Claim: atomically take every minute of the appointment (see above). Two requests that
+ *    both passed step 1 for the same or overlapping times cannot both pass step 2.
+ * 3. Write the booking. If that fails, give the minutes back.
  *
- * Postgres equivalent: `SELECT ... FOR UPDATE` on the business row (or an advisory lock)
- * before the overlap check, or an EXCLUDE USING gist constraint on tstzrange(starts_at, ends_at).
+ * A partial unique index on (businessId, startsAt) where status = confirmed is a final safety
+ * net for any code path that skips the claim.
+ *
+ * Postgres equivalent: an EXCLUDE USING gist constraint on tstzrange(starts_at, ends_at),
+ * or SELECT ... FOR UPDATE on the business row inside a transaction.
  */
-export function createBooking(db: DB, input: CreateBookingInput): CreateBookingResult {
+export async function createBooking(db: DB, input: CreateBookingInput): Promise<CreateBookingResult> {
   const { business, service } = input;
   const now = input.now ?? Date.now();
 
+  const date = localDate(input.startsAt, business.timezone);
+  const free = await computeSlots(db, business, service, date, now);
+  if (!free.some((s) => s.startsAt === input.startsAt)) {
+    // Distinguish "someone beat you to it" from "that was never a valid slot".
+    const wouldBeValid = await computeSlots(db, business, service, date, now, { ignoreBookings: true });
+    return {
+      ok: false,
+      reason: wouldBeValid.some((s) => s.startsAt === input.startsAt) ? "slot_taken" : "slot_unavailable",
+    };
+  }
+
+  const bookingId = randomUUID();
+  const endsAt = input.startsAt + service.durationMin * MINUTE;
+  if (!(await claimSlot(db, bookingId, business.id, input.startsAt, endsAt))) {
+    return { ok: false, reason: "slot_taken" };
+  }
+
+  const booking: Booking = {
+    id: bookingId,
+    businessId: business.id,
+    serviceId: service.id,
+    customerName: input.customerName,
+    customerEmail: input.customerEmail,
+    startsAt: input.startsAt,
+    endsAt,
+    status: "confirmed",
+    createdAt: now,
+  };
   try {
-    return db.transaction(
-      (tx) => {
-        const date = localDate(input.startsAt, business.timezone);
-        const free = computeSlots(tx, business, service, date, now);
-
-        if (!free.some((s) => s.startsAt === input.startsAt)) {
-          // Distinguish "someone beat you to it" from "that was never a valid slot".
-          const wouldBeValid = computeSlots(tx, business, service, date, now, { ignoreBookings: true });
-          return {
-            ok: false as const,
-            reason: wouldBeValid.some((s) => s.startsAt === input.startsAt) ? ("slot_taken" as const) : ("slot_unavailable" as const),
-          };
-        }
-
-        const booking: Booking = {
-          id: randomUUID(),
-          businessId: business.id,
-          serviceId: service.id,
-          customerName: input.customerName,
-          customerEmail: input.customerEmail,
-          startsAt: input.startsAt,
-          endsAt: input.startsAt + service.durationMin * 60_000,
-          status: "confirmed",
-          createdAt: now,
-        };
-        tx.insert(bookings).values(booking).run();
-        return { ok: true as const, booking };
-      },
-      { behavior: "immediate" },
-    );
+    await insertRow(db.bookings, booking);
   } catch (e) {
-    if (isConstraintError(e)) return { ok: false, reason: "slot_taken" };
+    await releaseLocks(db, bookingId);
+    if (isDuplicateKeyError(e)) return { ok: false, reason: "slot_taken" };
     throw e;
   }
+  return { ok: true, booking };
 }
 
 export type BookingWithService = Booking & { serviceName: string };
 
-export function listBookings(
-  db: Executor,
+export async function listBookings(
+  db: DB,
   businessId: string,
   scope: "upcoming" | "past" | "all",
   now = Date.now(),
-): BookingWithService[] {
-  const filters = [eq(bookings.businessId, businessId)];
-  if (scope === "upcoming") filters.push(gte(bookings.endsAt, now));
-  if (scope === "past") filters.push(lt(bookings.endsAt, now));
+): Promise<BookingWithService[]> {
+  const filter =
+    scope === "upcoming"
+      ? { businessId, endsAt: { $gte: now } }
+      : scope === "past"
+        ? { businessId, endsAt: { $lt: now } }
+        : { businessId };
 
-  const rows = db
-    .select({ booking: bookings, serviceName: services.name })
-    .from(bookings)
-    .innerJoin(services, eq(bookings.serviceId, services.id))
-    .where(and(...filters))
-    .orderBy(scope === "past" ? desc(bookings.startsAt) : asc(bookings.startsAt))
+  const rows = await db.bookings
+    .find(filter, NO_ID)
+    .sort({ startsAt: scope === "past" ? -1 : 1 })
     .limit(500)
-    .all();
+    .toArray();
 
-  return rows.map((r) => ({ ...r.booking, serviceName: r.serviceName }));
+  const serviceIds = [...new Set(rows.map((r) => r.serviceId))];
+  const names = new Map(
+    (await db.services.find({ _id: { $in: serviceIds } }, { projection: { _id: 1, name: 1 } }).toArray()).map((s) => [s._id, s.name]),
+  );
+  return rows.map((r) => ({ ...r, serviceName: names.get(r.serviceId) ?? "(removed service)" }));
 }
 
 /** Cancel (idempotent). Returns null if the booking is not in this tenant. */
-export function cancelBooking(db: Executor, businessId: string, bookingId: string): Booking | null {
-  const existing = db
-    .select()
-    .from(bookings)
-    .where(and(eq(bookings.id, bookingId), eq(bookings.businessId, businessId)))
-    .get();
+export async function cancelBooking(db: DB, businessId: string, bookingId: string): Promise<Booking | null> {
+  const existing = await db.bookings.findOne({ _id: bookingId, businessId }, NO_ID);
   if (!existing) return null;
-  if (existing.status === "cancelled") return existing;
 
-  db.update(bookings).set({ status: "cancelled" }).where(eq(bookings.id, bookingId)).run();
+  if (existing.status === "confirmed") {
+    // Order matters: mark cancelled first, then free the minutes. If we die in between, the
+    // leftover locks belong to a cancelled booking and clearStaleLocks() reclaims them.
+    // The reverse order could leave a confirmed booking with no locks.
+    await db.bookings.updateOne({ _id: bookingId, businessId }, { $set: { status: "cancelled" } });
+  }
+  await releaseLocks(db, bookingId); // also heals leftovers when cancelling an already-cancelled booking
   return { ...existing, status: "cancelled" };
 }

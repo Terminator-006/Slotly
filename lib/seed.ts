@@ -1,8 +1,16 @@
 import bcrypt from "bcryptjs";
-import { randomUUID } from "node:crypto";
-import { count, eq } from "drizzle-orm";
-import type { DB } from "./db";
-import { availability, businesses, services, users } from "./schema";
+import { createHash } from "node:crypto";
+import { insertRow, isDuplicateKeyError, type DB, type Doc } from "./db";
+import type { Collection } from "mongodb";
+
+/**
+ * Deterministic, UUID-shaped ids for demo rows. Seeding is therefore idempotent: running it
+ * twice (or from two serverless instances at once) can only ever produce the same documents.
+ */
+function demoId(name: string): string {
+  const h = createHash("sha1").update(`slotly-demo:${name}`).digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
 
 export const DEMO = {
   slug: "demo-barber",
@@ -21,59 +29,69 @@ export function defaultDemoWindows() {
   return rows;
 }
 
-/** Creates the demo business. Returns false if the slug is already taken. */
-export function seedDemo(db: DB): boolean {
-  const now = Date.now();
-  const businessId = randomUUID();
-
-  return db.transaction((tx) => {
-    const taken = tx.select({ id: businesses.id }).from(businesses).where(eq(businesses.slug, DEMO.slug)).get();
-    if (taken) return false;
-
-    tx.insert(businesses)
-      .values({
-        id: businessId,
-        name: "Fade & Co Barbers",
-        slug: DEMO.slug,
-        timezone: "Europe/Berlin",
-        currency: "EUR",
-        createdAt: now,
-      })
-      .run();
-
-    tx.insert(users)
-      .values({
-        id: randomUUID(),
-        businessId,
-        email: DEMO.email,
-        passwordHash: bcrypt.hashSync(DEMO.password, 10),
-        role: "owner",
-        createdAt: now,
-      })
-      .run();
-
-    const catalogue = [
-      { name: "Classic haircut", durationMin: 30, priceCents: 2500 },
-      { name: "Skin fade", durationMin: 45, priceCents: 3200 },
-      { name: "Beard trim", durationMin: 20, priceCents: 1500 },
-      { name: "Cut + beard combo", durationMin: 60, priceCents: 4200 },
-    ];
-    for (const s of catalogue) {
-      tx.insert(services)
-        .values({ id: randomUUID(), businessId, ...s, active: true, createdAt: now })
-        .run();
-    }
-
-    for (const w of defaultDemoWindows()) {
-      tx.insert(availability)
-        .values({ id: randomUUID(), businessId, ...w })
-        .run();
-    }
+/** Insert unless a document with that id already exists. */
+async function insertIfAbsent<T extends { id: string }>(col: Collection<Doc<T>>, row: T): Promise<boolean> {
+  try {
+    await insertRow(col, row);
     return true;
-  });
+  } catch (e) {
+    if (isDuplicateKeyError(e)) return false;
+    throw e;
+  }
 }
 
-export function seedDemoIfEmpty(db: DB): void {
-  const [row] = db.select({ n: count() }).from(businesses).all();
-  if (!row || row.n === 0) seedDemo(db);
+/**
+ * Ensure the demo business exists and is complete. Returns true if this call created the
+ * business. Safe to call concurrently and repeatedly.
+ */
+export async function seedDemo(db: DB): Promise<boolean> {
+  const now = Date.now();
+  const businessId = demoId("business");
+
+  // A real business already using the demo slug (different id) is left alone.
+  const created = await insertIfAbsent(db.businesses, {
+    id: businessId,
+    name: "Fade & Co Barbers",
+    slug: DEMO.slug,
+    timezone: "Europe/Berlin",
+    currency: "EUR",
+    createdAt: now,
+  });
+
+  await insertIfAbsent(db.users, {
+    id: demoId("owner"),
+    businessId,
+    email: DEMO.email,
+    passwordHash: await bcrypt.hash(DEMO.password, 10),
+    role: "owner",
+    createdAt: now,
+  });
+
+  const catalogue = [
+    { name: "Classic haircut", durationMin: 30, priceCents: 2500 },
+    { name: "Skin fade", durationMin: 45, priceCents: 3200 },
+    { name: "Beard trim", durationMin: 20, priceCents: 1500 },
+    { name: "Cut + beard combo", durationMin: 60, priceCents: 4200 },
+  ];
+  // createdAt is offset per row so the services keep their order when sorted by it.
+  for (const [i, s] of catalogue.entries()) {
+    await insertIfAbsent(db.services, {
+      id: demoId(`service:${s.name}`),
+      businessId,
+      ...s,
+      active: true,
+      createdAt: now + i,
+    });
+  }
+
+  for (const w of defaultDemoWindows()) {
+    await insertIfAbsent(db.availability, { id: demoId(`window:${w.weekday}:${w.startMin}`), businessId, ...w });
+  }
+  return created;
+}
+
+/** Make sure the demo exists (cheap check first, so normal requests pay one indexed lookup once per process). */
+export async function seedDemoIfMissing(db: DB): Promise<void> {
+  const exists = await db.businesses.findOne({ _id: demoId("business") }, { projection: { _id: 1 } });
+  if (!exists) await seedDemo(db);
 }

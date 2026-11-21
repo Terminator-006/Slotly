@@ -1,39 +1,32 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { and, asc, eq } from "drizzle-orm";
 import BookingWidget from "@/components/BookingWidget";
 import { Logo } from "@/components/ui";
-import { getDb } from "@/lib/db";
-import { businesses, services } from "@/lib/schema";
+import { getDb, NO_ID } from "@/lib/db";
 import { apiBusiness, apiService } from "@/lib/serialize";
 
 export const dynamic = "force-dynamic";
 
 type Props = { params: Promise<{ slug: string }> };
 
-function load(slug: string) {
-  const db = getDb();
-  const business = db.select().from(businesses).where(eq(businesses.slug, slug)).get();
+async function load(slug: string) {
+  const db = await getDb();
+  const business = await db.businesses.findOne({ slug }, NO_ID);
   if (!business) return null;
-  const rows = db
-    .select()
-    .from(services)
-    .where(and(eq(services.businessId, business.id), eq(services.active, true)))
-    .orderBy(asc(services.createdAt))
-    .all();
+  const rows = await db.services.find({ businessId: business.id, active: true }, NO_ID).sort({ createdAt: 1 }).toArray();
   return { business, services: rows };
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { slug } = await params;
-  const data = load(slug);
+  const data = await load(slug);
   return data ? { title: `Book at ${data.business.name}` } : { title: "Not found" };
 }
 
 export default async function PublicBookingPage({ params }: Props) {
   const { slug } = await params;
-  const data = load(slug);
+  const data = await load(slug);
   if (!data) notFound();
 
   return (
