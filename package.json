@@ -4,7 +4,7 @@
   "private": true,
   "description": "Multi-tenant appointment booking SaaS for small businesses",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "scripts": {
     "dev": "next dev",

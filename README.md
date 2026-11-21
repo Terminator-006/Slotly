@@ -24,7 +24,7 @@ The interesting parts are the ones that are easy to get subtly wrong: **timezone
 
 ## Quick start
 
-Requires Node 20+ (see `.nvmrc`).
+Requires **Node 22.12 or newer** (see `.nvmrc`; run `nvm use`).
 
 ```bash
 npm install
